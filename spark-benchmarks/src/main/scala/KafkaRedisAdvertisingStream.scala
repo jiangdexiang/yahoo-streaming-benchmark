@@ -43,6 +43,16 @@ object KafkaRedisAdvertisingStream {
       case other => throw new ClassCastException(other + " not a String")
     }
 
+    val redisPort = commonConfig.get("redis.port") match {
+      case n: Number => n.intValue()
+      case other => throw new ClassCastException(other + " not a Number")
+    }
+
+    val redisPassword = commonConfig.get("redis.password") match {
+      case s: String => s
+      case other => throw new ClassCastException(other + " not a String")
+    }
+
     // Create context with 2 second batch interval
     val sparkConf = new SparkConf().setAppName("KafkaRedisAdvertisingStream")
     if (isLocal) {
@@ -101,7 +111,7 @@ object KafkaRedisAdvertisingStream {
     val projected = filteredOnView.map(eventProjection)
 
     //Note that the Storm benchmark caches the results from Redis, we don't do that here yet
-    val redisJoined = projected.mapPartitions(queryRedisTopLevel(_, redisHost), preservePartitioning = false)
+    val redisJoined = projected.mapPartitions(queryRedisTopLevel(_, redisHost, redisPort, redisPassword), preservePartitioning = false)
 
     val campaign_timeStamp = redisJoined.map(campaignTime)
     //each record in the RDD: key:(campaign_id : String, window_time: Long),  Value: (ad_id : String)
@@ -119,7 +129,7 @@ object KafkaRedisAdvertisingStream {
     //Repartition here if desired to use more or less executors
     //    val totalEventsPerCampaignTime_repartitioned = totalEventsPerCampaignTime.repartition(20)
 
-    val final_results = totalEventsPerCampaignTime.mapPartitions(writeRedisTopLevel(_, redisHost), preservePartitioning = false)
+    val final_results = totalEventsPerCampaignTime.mapPartitions(writeRedisTopLevel(_, redisHost, redisPort, redisPassword), preservePartitioning = false)
     final_results.count().print()
 
     // Start the computation
@@ -160,28 +170,36 @@ object KafkaRedisAdvertisingStream {
   def eventProjection(event: Array[String]): Array[String] = {
     Array(
       event(0), //ucid
-      event(5)) //time_local
+      event(6)) //time_local
   }
 
-  def queryRedisTopLevel(eventsIterator: Iterator[Array[String]], redisHost: String): Iterator[Array[String]] = {
-    val pool = new Pool(new JedisPool(new JedisPoolConfig(), redisHost, 10145, 2000))
-    val ad_to_campaign = new util.HashMap[String, String]()
-    val eventsIteratorMap = eventsIterator.map(event => queryRedis(pool, ad_to_campaign, event))
+  def queryRedisTopLevel(eventsIterator: Iterator[Array[String]], redisHost: String, redisPort: Int, redisPassword: String): Iterator[Array[String]] = {
+    val pool = new Pool(new JedisPool(new JedisPoolConfig(), redisHost, redisPort, 2000, redisPassword))
+    val ad2campaign = new util.HashMap[String, String]()
+    val eventsIteratorMap = eventsIterator.map(event => queryRedis(pool, ad2campaign, event))
     pool.underlying.getResource.close()
     eventsIteratorMap
   }
 
-  def queryRedis(pool: Pool, ad_to_campaign: util.HashMap[String, String], event: Array[String]): Array[String] = {
-    val ad_id = event(0)
-    val campaign_id_cache = ad_to_campaign.get(ad_id)
+  def queryRedis(pool: Pool, ad2campaign: util.HashMap[String, String], event: Array[String]): Array[String] = {
+    val ucid = event(0)
+    val campaign_id_cache = ad2campaign.get(ucid)
     if (campaign_id_cache == null) {
       pool.withJedisClient { client =>
-        val campaign_id_temp = Dress.up(client).get(ad_id)
-        if (campaign_id_temp.isDefined) {
-          val campaign_id = campaign_id_temp.get
-          ad_to_campaign.put(ad_id, campaign_id)
+        //        val campaign_id_temp = Dress.up(client).get(ucid)
+        //        if (campaign_id_temp.isDefined) {
+        //          val campaign_id = campaign_id_temp.get
+        //          ad2campaign.put(ucid, campaign_id)
+        //          Array(campaign_id, event(0), event(1))
+        //          campaign_id, ad_id, event_time
+        //        } else {
+        //          Array("Campaign_ID not found in either cache nore Redis for the given ad_id!", event(0), event(1))
+        //        }
+        val campaign_id = client.get(ucid)
+        if (campaign_id != null) {
+          ad2campaign.put(ucid, campaign_id)
           Array(campaign_id, event(0), event(1))
-          //campaign_id, ad_id, event_time
+          //          campaign_id, ad_id, event_time
         } else {
           Array("Campaign_ID not found in either cache nore Redis for the given ad_id!", event(0), event(1))
         }
@@ -197,8 +215,8 @@ object KafkaRedisAdvertisingStream {
     //Key: (campaign_id, window_time),  Value: ad_id
   }
 
-  def writeRedisTopLevel(campaign_window_counts_Iterator: Iterator[((String, Long), Int)], redisHost: String): Iterator[String] = {
-    val pool = new Pool(new JedisPool(new JedisPoolConfig(), redisHost, 6379, 2000))
+  def writeRedisTopLevel(campaign_window_counts_Iterator: Iterator[((String, Long), Int)], redisHost: String, redisPort: Int, redisPassword: String): Iterator[String] = {
+    val pool = new Pool(new JedisPool(new JedisPoolConfig(), redisHost, redisPort, 2000, redisPassword))
 
     val campaign_window_counts_IteratorMap =
       campaign_window_counts_Iterator.map(campaign_window_counts => writeWindow(pool, campaign_window_counts))

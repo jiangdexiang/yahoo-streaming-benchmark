@@ -14,45 +14,45 @@ import java.util.Map;
  * original benchmarking tools.
  */
 public class RedisHelper {
-  private static final Logger LOG = LoggerFactory.getLogger(RedisHelper.class);
+    private static final Logger LOG = LoggerFactory.getLogger(RedisHelper.class);
 
-  private final BenchmarkConfig config;
+    private final BenchmarkConfig config;
 
-  public RedisHelper(BenchmarkConfig config){
-    this.config = config;
-  }
-
-  public void prepareRedis(Map<String, List<String>> campaigns) {
-    Jedis redis = new Jedis(config.redisHost);
-    redis.select(config.redisDb);
-    if (config.redisFlush) {
-      LOG.info("Flushing Redis DB.");
-      redis.flushDB();
+    public RedisHelper(BenchmarkConfig config) {
+        this.config = config;
     }
 
-    LOG.info("Preparing Redis with campaign data.");
-    for (Map.Entry<String, List<String>> entry : campaigns.entrySet()) {
-      String campaign = entry.getKey();
-      redis.sadd("campaigns", campaign);
-      for (String ad : entry.getValue()) {
-        redis.set(ad, campaign);
-      }
-    }
-    redis.close();
-  }
-
-  public void writeCampaignFile(Map<String, List<String>> campaigns) {
-    try {
-      PrintWriter adToCampaignFile = new PrintWriter("ad-to-campaign-ids.txt");
-      for (Map.Entry<String, List<String>> entry : campaigns.entrySet()) {
-        String campaign = entry.getKey();
-        for (String ad : entry.getValue()) {
-          adToCampaignFile.println("{\"" + ad + "\":\"" + campaign + "\"}");
+    public void prepareRedis(Map<String, List<String>> campaigns) {
+        Jedis redis = new Jedis(config.redisHost);
+        redis.select(config.redisDb);
+        if (config.redisFlush) {
+            LOG.info("Flushing Redis DB.");
+            redis.flushDB();
         }
-      }
-      adToCampaignFile.close();
-    } catch (Throwable t) {
-      throw new RuntimeException("Error opening ads file", t);
+
+        LOG.info("Preparing Redis with campaign data.");
+        for (Map.Entry<String, List<String>> entry : campaigns.entrySet()) {
+            String campaign = entry.getKey();
+            redis.sadd("campaigns", campaign);
+            for (String ad : entry.getValue()) {
+                redis.set(ad, campaign);
+            }
+        }
+        redis.close();
     }
-  }
+
+    public void writeCampaignFile(Map<String, List<String>> campaigns) {
+        try {
+            PrintWriter adToCampaignFile = new PrintWriter("ad-to-campaign-ids.txt");
+            for (Map.Entry<String, List<String>> entry : campaigns.entrySet()) {
+                String campaign = entry.getKey();
+                for (String ad : entry.getValue()) {
+                    adToCampaignFile.println("{\"" + ad + "\":\"" + campaign + "\"}");
+                }
+            }
+            adToCampaignFile.close();
+        } catch (Throwable t) {
+            throw new RuntimeException("Error opening ads file", t);
+        }
+    }
 }

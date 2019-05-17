@@ -11,6 +11,8 @@ zookeeper.servers: "localhost"
 zookeeper.port: 2181
 
 redis.host: "m10145.mars.test.redis.ljnode.com"
+redis.port: 10145
+redis.password: "4abb8dF528"
 
 process.hosts: 10
 process.cores: 12

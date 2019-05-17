@@ -22,14 +22,14 @@ import java.io.Serializable;
 
 public class StateNotFound<K extends Serializable> implements QueryResponse {
 
-	private final K key;
+    private final K key;
 
-	public StateNotFound(K key) {
-		this.key = key;
-	}
+    public StateNotFound(K key) {
+        this.key = key;
+    }
 
-	@Override
-	public String toString() {
-		return "StateNotFound(key: " + key + ")";
-	}
+    @Override
+    public String toString() {
+        return "StateNotFound(key: " + key + ")";
+    }
 }

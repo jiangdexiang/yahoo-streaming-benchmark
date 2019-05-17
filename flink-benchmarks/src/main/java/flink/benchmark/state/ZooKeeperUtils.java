@@ -23,24 +23,24 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 
 public class ZooKeeperUtils {
-	public static CuratorFramework startCuratorFramework(
-		String root,
-		String zkQuorum,
-		int sessionTimeout,
-		int connectionTimeout,
-		int retryWait,
-		int maxRetryAttempts) {
+    public static CuratorFramework startCuratorFramework(
+            String root,
+            String zkQuorum,
+            int sessionTimeout,
+            int connectionTimeout,
+            int retryWait,
+            int maxRetryAttempts) {
 
-		CuratorFramework result = CuratorFrameworkFactory.builder()
-			.connectString(zkQuorum)
-			.sessionTimeoutMs(sessionTimeout)
-			.connectionTimeoutMs(connectionTimeout)
-			.retryPolicy(new ExponentialBackoffRetry(retryWait, maxRetryAttempts))
-			.namespace(root.startsWith("/") ? root.substring(1) : root)
-			.build();
+        CuratorFramework result = CuratorFrameworkFactory.builder()
+                .connectString(zkQuorum)
+                .sessionTimeoutMs(sessionTimeout)
+                .connectionTimeoutMs(connectionTimeout)
+                .retryPolicy(new ExponentialBackoffRetry(retryWait, maxRetryAttempts))
+                .namespace(root.startsWith("/") ? root.substring(1) : root)
+                .build();
 
-		result.start();
+        result.start();
 
-		return result;
-	}
+        return result;
+    }
 }

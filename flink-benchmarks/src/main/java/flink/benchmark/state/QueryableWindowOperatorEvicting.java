@@ -22,9 +22,7 @@ import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 import akka.actor.Props;
 import com.typesafe.config.Config;
-
 import org.apache.flink.api.common.functions.RuntimeContext;
-import org.apache.flink.api.common.state.StateBackend;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.memory.DataInputView;
@@ -37,385 +35,384 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.StreamTaskState;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import scala.Option;
 import scala.Some;
 import scala.concurrent.duration.FiniteDuration;
 
 import java.io.Serializable;
 import java.net.UnknownHostException;
-import java.util.*;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 public class QueryableWindowOperatorEvicting
-		extends AbstractStreamOperator<Tuple3<String, Long, Long>>
-		implements OneInputStreamOperator<UUID, Tuple3<String, Long, Long>>,
-		QueryableKeyValueState<String, String> /* key: campaign_id (String), value: long (window count) */{
+        extends AbstractStreamOperator<Tuple3<String, Long, Long>>
+        implements OneInputStreamOperator<UUID, Tuple3<String, Long, Long>>,
+        QueryableKeyValueState<String, String> /* key: campaign_id (String), value: long (window count) */ {
 
-	private static final Logger LOG = LoggerFactory.getLogger(QueryableWindowOperatorEvicting.class);
+    private static final Logger LOG = LoggerFactory.getLogger(QueryableWindowOperatorEvicting.class);
 
-	private static final Object actorSystemLock = new Object();
-	private static ActorSystem actorSystem;
-	private static int actorSystemUsers = 0;
-	
-	private final long windowSize;
+    private static final Object actorSystemLock = new Object();
+    private static ActorSystem actorSystem;
+    private static int actorSystemUsers = 0;
 
-	private long lastWatermark = 0;
+    private final long windowSize;
 
-	// first key is the window key, i.e. the end of the window
-	// second key is the key of the element (campaign_id), value is count
-	// these are checkpointed, i.e. fault-tolerant
+    private long lastWatermark = 0;
 
-	// (campaign_id --> (window_end_ts, count)
-	private Map<Long, Map<UUID, CountAndAccessTime>> windows;
-	
-	private Map<UUID, CountAndAccessTime> currentWindowMap;
-	private long currentWindow;
+    // first key is the window key, i.e. the end of the window
+    // second key is the key of the element (campaign_id), value is count
+    // these are checkpointed, i.e. fault-tolerant
 
-	// we retain the windows for a bit after emitting to give
-	// them time to propagate to their final storage location
-	// they are not stored as part of checkpointing
-	// private Map<Long, Map<Long, Long>> retainedWindows;
-	// private long lastSetTriggerTime = 0;
+    // (campaign_id --> (window_end_ts, count)
+    private Map<Long, Map<UUID, CountAndAccessTime>> windows;
 
-	private final FiniteDuration timeout = new FiniteDuration(20, TimeUnit.SECONDS);
-	private final RegistrationService registrationService;
+    private Map<UUID, CountAndAccessTime> currentWindowMap;
+    private long currentWindow;
 
-	private final boolean trackAccessTime;
-	
+    // we retain the windows for a bit after emitting to give
+    // them time to propagate to their final storage location
+    // they are not stored as part of checkpointing
+    // private Map<Long, Map<Long, Long>> retainedWindows;
+    // private long lastSetTriggerTime = 0;
 
-	public QueryableWindowOperatorEvicting(
-				long windowSize, RegistrationService registrationService, boolean trackAccessTime) {
-		this.windowSize = windowSize;
-		this.registrationService = registrationService;
-		this.trackAccessTime = trackAccessTime;
-	}
+    private final FiniteDuration timeout = new FiniteDuration(20, TimeUnit.SECONDS);
+    private final RegistrationService registrationService;
 
-	@Override
-	public void open() throws Exception {
-		super.open();
-
-		LOG.info("Opening QueryableWindowOperator {}." , this);
-
-		// don't overwrite if this was initialized in restoreState()
-		if (windows == null) {
-			windows = new HashMap<>();
-		}
-
-		// retainedWindows = new HashMap<>();
-
-		if(registrationService != null) {
-			registrationService.start();
-
-			String hostname = registrationService.getConnectingHostname();
-			String actorName = "responseActor_" + getRuntimeContext().getIndexOfThisSubtask() + System.nanoTime();
-
-			initializeActorSystem(hostname);
-
-			ActorRef responseActor = actorSystem.actorOf(Props.create(ResponseActor.class, this), actorName);
-
-			String akkaURL = AkkaUtils.getAkkaURL(actorSystem, responseActor);
-
-			registrationService.registerActor(getRuntimeContext().getIndexOfThisSubtask(), akkaURL);
-		}
-	}
-
-	@Override
-	public void close() throws Exception {
-		LOG.info("Closing QueyrableWindowOperator {}.", this);
-		super.close();
-
-		if(registrationService != null) {
-			registrationService.stop();
-		}
-
-		closeActorSystem(timeout);
-	}
-
-	@Override
-	public void processElement(StreamRecord<UUID> streamRecord) throws Exception {
-		UUID key = streamRecord.getValue();
-		long timestamp = streamRecord.getTimestamp();
-		long windowTimeStamp = timestamp - (timestamp % windowSize) + windowSize;
-
-		synchronized (windows) {
-			Map<UUID, CountAndAccessTime> window;
-			if (currentWindow == windowTimeStamp) {
-				window = currentWindowMap;
-			}
-			else {
-				window = windows.get(windowTimeStamp);
-				if (window == null) {
-					window = new HashMap<>();
-					windows.put(windowTimeStamp, window);
-				}
-				
-				currentWindowMap = window;
-				currentWindow = windowTimeStamp;
-			}
-			
-			CountAndAccessTime previous = window.get(key);
-			if (previous == null) {
-				previous = new CountAndAccessTime();
-				window.put(key, previous);
-				previous.count = 1L;
-				previous.lastEventTime = timestamp;
-			} else {
-				previous.count++;
-				previous.lastEventTime = Math.max(previous.lastEventTime, timestamp);
-			}
-			
-			if (trackAccessTime) {
-				previous.lastAccessTime = System.currentTimeMillis();
-			}
-		}
-	}
-
-	@Override
-	public void processWatermark(Watermark watermark) throws Exception {
-
-		StreamRecord<Tuple3<String, Long, Long>> result = new StreamRecord<>(null, -1);
-
-		Iterator<Map.Entry<Long, Map<UUID, CountAndAccessTime>>> iterator = windows.entrySet().iterator();
-		
-		while (iterator.hasNext()) {
-			Map.Entry<Long, Map<UUID, CountAndAccessTime>> entry = iterator.next();
-			
-			if (entry.getKey() < watermark.getTimestamp()) {
-				iterator.remove();
-				Long windowTimestamp = entry.getKey();
-				
-				// emit window
-				for (Map.Entry<UUID, CountAndAccessTime> window : entry.getValue().entrySet()) {
-					Tuple3<String, Long, Long> resultTuple = Tuple3.of(window.getKey().toString(), windowTimestamp, window.getValue().count);
-					output.collect(result.replace(resultTuple));
-				}
-			}
-		}
-		
-		lastWatermark = watermark.getTimestamp();
-	}
+    private final boolean trackAccessTime;
 
 
-	@Override
-	public StreamTaskState snapshotOperatorState(final long checkpointId, final long timestamp) throws Exception {
-		
-		LOG.info("Start async checkpoint @ " + getRuntimeContext().getTaskNameWithSubtasks());
-		
-		StreamTaskState taskState = super.snapshotOperatorState(checkpointId, timestamp);
+    public QueryableWindowOperatorEvicting(
+            long windowSize, RegistrationService registrationService, boolean trackAccessTime) {
+        this.windowSize = windowSize;
+        this.registrationService = registrationService;
+        this.trackAccessTime = trackAccessTime;
+    }
 
-		final Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot = new HashMap<>(windows.size());
-		
-		synchronized (windows) {
-			for (Map.Entry<Long, Map<UUID, CountAndAccessTime>> window : windows.entrySet()) {
-				stateSnapshot.put(window.getKey(), new HashMap<>(window.getValue()));
-			}
-		}
+    @Override
+    public void open() throws Exception {
+        super.open();
 
-		AsynchronousStateHandle<DataInputView> asyncState = new DataInputViewAsynchronousStateHandle(
-				checkpointId,
-				timestamp,
-				stateSnapshot,
-				getStateBackend());
+        LOG.info("Opening QueryableWindowOperator {}.", this);
 
-		taskState.setOperatorState(asyncState);
+        // don't overwrite if this was initialized in restoreState()
+        if (windows == null) {
+            windows = new HashMap<>();
+        }
 
-		LOG.info("Done async checkpoint @ " + getRuntimeContext().getTaskNameWithSubtasks());
-		
-		return taskState;
-	}
+        // retainedWindows = new HashMap<>();
 
-	@Override
-	public void notifyOfCompletedCheckpoint(long checkpointId) throws Exception {
-		super.notifyOfCompletedCheckpoint(checkpointId);
-	}
+        if (registrationService != null) {
+            registrationService.start();
 
-	@Override
-	public void restoreState(StreamTaskState taskState, long recoveryTimestamp) throws Exception {
-		super.restoreState(taskState, recoveryTimestamp);
+            String hostname = registrationService.getConnectingHostname();
+            String actorName = "responseActor_" + getRuntimeContext().getIndexOfThisSubtask() + System.nanoTime();
 
-		@SuppressWarnings("unchecked")
-		StateHandle<DataInputView> inputState = (StateHandle<DataInputView>) taskState.getOperatorState();
-		DataInputView in = inputState.getState(getUserCodeClassloader());
+            initializeActorSystem(hostname);
 
-		int numWindows = in.readInt();
+            ActorRef responseActor = actorSystem.actorOf(Props.create(ResponseActor.class, this), actorName);
 
-		this.windows = new HashMap<>(numWindows);
+            String akkaURL = AkkaUtils.getAkkaURL(actorSystem, responseActor);
 
-		for (int i = 0; i < numWindows; i++) {
-			Long windowTimestamp = in.readLong();
-			Map<UUID, CountAndAccessTime> window = new HashMap<>();
-			windows.put(windowTimestamp, window);
+            registrationService.registerActor(getRuntimeContext().getIndexOfThisSubtask(), akkaURL);
+        }
+    }
 
-			int numKeys = in.readInt();
-			for (int j = 0; j < numKeys; j++) {
-				UUID key = new UUID(in.readLong(), in.readLong());
-				CountAndAccessTime value = new CountAndAccessTime();
-				value.count = in.readLong();
-				window.put(key, value);
-			}
-		}
-	}
+    @Override
+    public void close() throws Exception {
+        LOG.info("Closing QueyrableWindowOperator {}.", this);
+        super.close();
 
-	/**
-	 * Note: This method has nothing to do with a regular getValue() implementation.
-	 * Its more designed as a remote debugger
-	 *
-	 * @throws WrongKeyPartitionException
-	 */
-	@Override
-	public String getValue(Long timestamp, String key) throws WrongKeyPartitionException {
-		LOG.info("Query for timestamp {} and key {}", timestamp, key);
-		
-		if (Math.abs(key.hashCode() % getRuntimeContext().getNumberOfParallelSubtasks()) != getRuntimeContext().getIndexOfThisSubtask()) {
-			throw new WrongKeyPartitionException("Key " + key + " is not part of the partition " +
-					"of subtask " + getRuntimeContext().getIndexOfThisSubtask());
-		}
+        if (registrationService != null) {
+            registrationService.stop();
+        }
 
-		if (windows == null) {
-			return "No windows created yet";
-		}
+        closeActorSystem(timeout);
+    }
 
-		if (timestamp != null) {
-			long ts = timestamp;
-			timestamp = ts - (ts % windowSize) + windowSize;
-		}
-		
-		UUID keyUUID = null;
-		try {
-			keyUUID = UUID.fromString(key);
-		} catch (Exception e) {}
+    @Override
+    public void processElement(StreamRecord<UUID> streamRecord) throws Exception {
+        UUID key = streamRecord.getValue();
+        long timestamp = streamRecord.getTimestamp();
+        long windowTimeStamp = timestamp - (timestamp % windowSize) + windowSize;
 
-		synchronized (windows) {
-			Map<UUID, CountAndAccessTime> window;
-			if (timestamp != null) {
-				window = windows.get(timestamp);
-				if (window == null) {
-					return "Window not found. Available window times " + windows.keySet().toString();
-				}
-			}
-			else if (currentWindowMap != null) {
-				window = currentWindowMap;
-			}
-			else {
-				return "No data yet";
-			}
-			
-			CountAndAccessTime cat = window.get(keyUUID);
-			if (cat != null) {
-				return Long.toString(cat.lastAccessTime - cat.lastEventTime);
-			}
-			else {
-				UUID[] keys = new UUID[5];
-				Iterator<UUID> iter = window.keySet().iterator();
-				
-				int i = 0;
-				while (iter.hasNext() && i < keys.length) {
-					keys[i++] = iter.next();
-				}
-				
-				return "Key not found. Sample keys are " + Arrays.toString(keys);
-			}
-		}
-	}
+        synchronized (windows) {
+            Map<UUID, CountAndAccessTime> window;
+            if (currentWindow == windowTimeStamp) {
+                window = currentWindowMap;
+            } else {
+                window = windows.get(windowTimeStamp);
+                if (window == null) {
+                    window = new HashMap<>();
+                    windows.put(windowTimeStamp, window);
+                }
 
-	@Override
-	public String toString() {
-		RuntimeContext ctx = getRuntimeContext();
+                currentWindowMap = window;
+                currentWindow = windowTimeStamp;
+            }
 
-		return ctx.getTaskName() + " (" + ctx.getIndexOfThisSubtask() + "/" + ctx.getNumberOfParallelSubtasks() + ")";
-	}
+            CountAndAccessTime previous = window.get(key);
+            if (previous == null) {
+                previous = new CountAndAccessTime();
+                window.put(key, previous);
+                previous.count = 1L;
+                previous.lastEventTime = timestamp;
+            } else {
+                previous.count++;
+                previous.lastEventTime = Math.max(previous.lastEventTime, timestamp);
+            }
 
-	private static class CountAndAccessTime implements Serializable {
-		long count;
-		long lastAccessTime;
-		long lastEventTime;
+            if (trackAccessTime) {
+                previous.lastAccessTime = System.currentTimeMillis();
+            }
+        }
+    }
 
-		@Override
-		public String toString() {
-			return "CountAndAccessTime{count=" + count + ", lastAccessTime=" + lastAccessTime +'}';
-		}
-	}
+    @Override
+    public void processWatermark(Watermark watermark) throws Exception {
+
+        StreamRecord<Tuple3<String, Long, Long>> result = new StreamRecord<>(null, -1);
+
+        Iterator<Map.Entry<Long, Map<UUID, CountAndAccessTime>>> iterator = windows.entrySet().iterator();
+
+        while (iterator.hasNext()) {
+            Map.Entry<Long, Map<UUID, CountAndAccessTime>> entry = iterator.next();
+
+            if (entry.getKey() < watermark.getTimestamp()) {
+                iterator.remove();
+                Long windowTimestamp = entry.getKey();
+
+                // emit window
+                for (Map.Entry<UUID, CountAndAccessTime> window : entry.getValue().entrySet()) {
+                    Tuple3<String, Long, Long> resultTuple = Tuple3.of(window.getKey().toString(), windowTimestamp, window.getValue().count);
+                    output.collect(result.replace(resultTuple));
+                }
+            }
+        }
+
+        lastWatermark = watermark.getTimestamp();
+    }
 
 
-	private static void initializeActorSystem(String hostname) throws UnknownHostException {
-		synchronized (actorSystemLock) {
-			if (actorSystem == null) {
-				Configuration config = new Configuration();
-				Option<scala.Tuple2<String, Object>> remoting = new Some<>(new scala.Tuple2<String, Object>(hostname, 0));
+    @Override
+    public StreamTaskState snapshotOperatorState(final long checkpointId, final long timestamp) throws Exception {
 
-				Config akkaConfig = AkkaUtils.getAkkaConfig(config, remoting);
+        LOG.info("Start async checkpoint @ " + getRuntimeContext().getTaskNameWithSubtasks());
 
-				LOG.info("Start actory system.");
-				actorSystem = ActorSystem.create("queryableWindow", akkaConfig);
-				actorSystemUsers = 1;
-			} else {
-				LOG.info("Actor system has already been started.");
-				actorSystemUsers++;
-			}
-		}
-	}
+        StreamTaskState taskState = super.snapshotOperatorState(checkpointId, timestamp);
 
-	private static void closeActorSystem(FiniteDuration timeout) {
-		synchronized (actorSystemLock) {
-			actorSystemUsers--;
+        final Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot = new HashMap<>(windows.size());
 
-			if (actorSystemUsers == 0 && actorSystem != null) {
-				actorSystem.shutdown();
-				actorSystem.awaitTermination(timeout);
+        synchronized (windows) {
+            for (Map.Entry<Long, Map<UUID, CountAndAccessTime>> window : windows.entrySet()) {
+                stateSnapshot.put(window.getKey(), new HashMap<>(window.getValue()));
+            }
+        }
 
-				actorSystem = null;
-			}
-		}
-	}
+        AsynchronousStateHandle<DataInputView> asyncState = new DataInputViewAsynchronousStateHandle(
+                checkpointId,
+                timestamp,
+                stateSnapshot,
+                getStateBackend());
 
-	private static class DataInputViewAsynchronousStateHandle extends AsynchronousStateHandle<DataInputView> {
+        taskState.setOperatorState(asyncState);
 
-		private final long checkpointId;
-		private final long timestamp;
-		private Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot;
-		private AbstractStateBackend backend;
-		private long size = 0;
+        LOG.info("Done async checkpoint @ " + getRuntimeContext().getTaskNameWithSubtasks());
 
-		public DataInputViewAsynchronousStateHandle(long checkpointId,
-				long timestamp,
-				Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot,
-													AbstractStateBackend backend) {
-			this.checkpointId = checkpointId;
-			this.timestamp = timestamp;
-			this.stateSnapshot = stateSnapshot;
-			this.backend = backend;
-		}
+        return taskState;
+    }
 
-		@Override
-		public StateHandle<DataInputView> materialize() throws Exception {
+    @Override
+    public void notifyOfCompletedCheckpoint(long checkpointId) throws Exception {
+        super.notifyOfCompletedCheckpoint(checkpointId);
+    }
 
-			AbstractStateBackend.CheckpointStateOutputView out =
-					backend.createCheckpointStateOutputView(checkpointId, timestamp);
-			
-			out.writeInt(stateSnapshot.size());
-			
-			for (Map.Entry<Long, Map<UUID, CountAndAccessTime>> window: stateSnapshot.entrySet()) {
-				out.writeLong(window.getKey());
-				out.writeInt(window.getValue().size());
+    @Override
+    public void restoreState(StreamTaskState taskState, long recoveryTimestamp) throws Exception {
+        super.restoreState(taskState, recoveryTimestamp);
 
-				for (Map.Entry<UUID, CountAndAccessTime> value : window.getValue().entrySet()) {
-					out.writeLong(value.getKey().getMostSignificantBits());
-					out.writeLong(value.getKey().getLeastSignificantBits());
-					out.writeLong(value.getValue().count);
-				}
-			}
+        @SuppressWarnings("unchecked")
+        StateHandle<DataInputView> inputState = (StateHandle<DataInputView>) taskState.getOperatorState();
+        DataInputView in = inputState.getState(getUserCodeClassloader());
 
-			this.size = out.size();
-			return out.closeAndGetHandle();
-		}
+        int numWindows = in.readInt();
 
-		@Override
-		public long getStateSize() throws Exception {
-			return size;
-		}
-	}
+        this.windows = new HashMap<>(numWindows);
+
+        for (int i = 0; i < numWindows; i++) {
+            Long windowTimestamp = in.readLong();
+            Map<UUID, CountAndAccessTime> window = new HashMap<>();
+            windows.put(windowTimestamp, window);
+
+            int numKeys = in.readInt();
+            for (int j = 0; j < numKeys; j++) {
+                UUID key = new UUID(in.readLong(), in.readLong());
+                CountAndAccessTime value = new CountAndAccessTime();
+                value.count = in.readLong();
+                window.put(key, value);
+            }
+        }
+    }
+
+    /**
+     * Note: This method has nothing to do with a regular getValue() implementation.
+     * Its more designed as a remote debugger
+     *
+     * @throws WrongKeyPartitionException
+     */
+    @Override
+    public String getValue(Long timestamp, String key) throws WrongKeyPartitionException {
+        LOG.info("Query for timestamp {} and key {}", timestamp, key);
+
+        if (Math.abs(key.hashCode() % getRuntimeContext().getNumberOfParallelSubtasks()) != getRuntimeContext().getIndexOfThisSubtask()) {
+            throw new WrongKeyPartitionException("Key " + key + " is not part of the partition " +
+                    "of subtask " + getRuntimeContext().getIndexOfThisSubtask());
+        }
+
+        if (windows == null) {
+            return "No windows created yet";
+        }
+
+        if (timestamp != null) {
+            long ts = timestamp;
+            timestamp = ts - (ts % windowSize) + windowSize;
+        }
+
+        UUID keyUUID = null;
+        try {
+            keyUUID = UUID.fromString(key);
+        } catch (Exception e) {
+        }
+
+        synchronized (windows) {
+            Map<UUID, CountAndAccessTime> window;
+            if (timestamp != null) {
+                window = windows.get(timestamp);
+                if (window == null) {
+                    return "Window not found. Available window times " + windows.keySet().toString();
+                }
+            } else if (currentWindowMap != null) {
+                window = currentWindowMap;
+            } else {
+                return "No data yet";
+            }
+
+            CountAndAccessTime cat = window.get(keyUUID);
+            if (cat != null) {
+                return Long.toString(cat.lastAccessTime - cat.lastEventTime);
+            } else {
+                UUID[] keys = new UUID[5];
+                Iterator<UUID> iter = window.keySet().iterator();
+
+                int i = 0;
+                while (iter.hasNext() && i < keys.length) {
+                    keys[i++] = iter.next();
+                }
+
+                return "Key not found. Sample keys are " + Arrays.toString(keys);
+            }
+        }
+    }
+
+    @Override
+    public String toString() {
+        RuntimeContext ctx = getRuntimeContext();
+
+        return ctx.getTaskName() + " (" + ctx.getIndexOfThisSubtask() + "/" + ctx.getNumberOfParallelSubtasks() + ")";
+    }
+
+    private static class CountAndAccessTime implements Serializable {
+        long count;
+        long lastAccessTime;
+        long lastEventTime;
+
+        @Override
+        public String toString() {
+            return "CountAndAccessTime{count=" + count + ", lastAccessTime=" + lastAccessTime + '}';
+        }
+    }
+
+
+    private static void initializeActorSystem(String hostname) throws UnknownHostException {
+        synchronized (actorSystemLock) {
+            if (actorSystem == null) {
+                Configuration config = new Configuration();
+                Option<scala.Tuple2<String, Object>> remoting = new Some<>(new scala.Tuple2<String, Object>(hostname, 0));
+
+                Config akkaConfig = AkkaUtils.getAkkaConfig(config, remoting);
+
+                LOG.info("Start actory system.");
+                actorSystem = ActorSystem.create("queryableWindow", akkaConfig);
+                actorSystemUsers = 1;
+            } else {
+                LOG.info("Actor system has already been started.");
+                actorSystemUsers++;
+            }
+        }
+    }
+
+    private static void closeActorSystem(FiniteDuration timeout) {
+        synchronized (actorSystemLock) {
+            actorSystemUsers--;
+
+            if (actorSystemUsers == 0 && actorSystem != null) {
+                actorSystem.shutdown();
+                actorSystem.awaitTermination(timeout);
+
+                actorSystem = null;
+            }
+        }
+    }
+
+    private static class DataInputViewAsynchronousStateHandle extends AsynchronousStateHandle<DataInputView> {
+
+        private final long checkpointId;
+        private final long timestamp;
+        private Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot;
+        private AbstractStateBackend backend;
+        private long size = 0;
+
+        public DataInputViewAsynchronousStateHandle(long checkpointId,
+                                                    long timestamp,
+                                                    Map<Long, Map<UUID, CountAndAccessTime>> stateSnapshot,
+                                                    AbstractStateBackend backend) {
+            this.checkpointId = checkpointId;
+            this.timestamp = timestamp;
+            this.stateSnapshot = stateSnapshot;
+            this.backend = backend;
+        }
+
+        @Override
+        public StateHandle<DataInputView> materialize() throws Exception {
+
+            AbstractStateBackend.CheckpointStateOutputView out =
+                    backend.createCheckpointStateOutputView(checkpointId, timestamp);
+
+            out.writeInt(stateSnapshot.size());
+
+            for (Map.Entry<Long, Map<UUID, CountAndAccessTime>> window : stateSnapshot.entrySet()) {
+                out.writeLong(window.getKey());
+                out.writeInt(window.getValue().size());
+
+                for (Map.Entry<UUID, CountAndAccessTime> value : window.getValue().entrySet()) {
+                    out.writeLong(value.getKey().getMostSignificantBits());
+                    out.writeLong(value.getKey().getLeastSignificantBits());
+                    out.writeLong(value.getValue().count);
+                }
+            }
+
+            this.size = out.size();
+            return out.closeAndGetHandle();
+        }
+
+        @Override
+        public long getStateSize() throws Exception {
+            return size;
+        }
+    }
 }
