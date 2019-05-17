@@ -27,11 +27,11 @@
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
-            <artifactId>kafka_${scala.binary.version}</artifactId>
+            <artifactId>kafka-clients</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
         </dependency>
         <dependency>
             <groupId>commons-cli</groupId>

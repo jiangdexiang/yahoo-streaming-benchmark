@@ -22,8 +22,8 @@
             <artifactId>slf4j-api</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
         </dependency>
         <dependency>
             <groupId>org.apache.flink</groupId>
@@ -31,7 +31,7 @@
         </dependency>
         <dependency>
             <groupId>org.apache.flink</groupId>
-            <artifactId>flink-connector-kafka-0.8_${scala.binary.version}</artifactId>
+            <artifactId>flink-connector-kafka-0.10_${scala.binary.version}</artifactId>
         </dependency>
         <dependency>
             <groupId>com.yahoo.stream</groupId>

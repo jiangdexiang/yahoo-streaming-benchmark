@@ -24,12 +24,12 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
-            <artifactId>kafka_${scala.binary.version}</artifactId>
+            <artifactId>kafka-clients</artifactId>
         </dependency>
         <dependency>
             <groupId>redis.clients</groupId>
@@ -38,16 +38,16 @@
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-core_${scala.binary.version}</artifactId>
-            <scope>provided</scope>
+            <!--<scope>provided</scope>-->
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-streaming_${scala.binary.version}</artifactId>
-            <scope>provided</scope>
+            <!--<scope>provided</scope>-->
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
-            <artifactId>spark-streaming-kafka_${scala.binary.version}</artifactId>
+            <artifactId>spark-streaming-kafka-0-10_${scala.binary.version}</artifactId>
         </dependency>
         <dependency>
             <groupId>org.sedis</groupId>

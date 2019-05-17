@@ -1,20 +1,16 @@
 # Copyright 2015, Yahoo Inc.
 # Licensed under the terms of the Apache License 2.0. Please see LICENSE file in the project root for terms.
 
-kafka.brokers:
-    - "localhost"
-kafka.port: "9092"
-kafka.topic: "ads"
-kafka.partitions: 20
-kafka.zookeeper.path: /
+kafka.bootstrap.server: "bigdata-kafka01.matrix.lianjia.com:9092,bigdata-kafka02.matrix.lianjia.com:9092,bigdata-kafka03.matrix.lianjia.com:9092"
+kafka.topic: "dp-bigc-base-log"
+kafka.group.id: "dp-bigc-base-log"
 
 akka.zookeeper.path: /akkaQuery
 
-zookeeper.servers:
-    - "localhost"
+zookeeper.servers: "localhost"
 zookeeper.port: 2181
 
-redis.host: "localhost"
+redis.host: "m10145.mars.test.redis.ljnode.com"
 
 process.hosts: 10
 process.cores: 12
